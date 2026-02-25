@@ -96,7 +96,6 @@ let stagedata=BuildYamlSnapshot
 | project StageName, TaskName,YamlId,deploymentRing,namespaceRingJSON
 | order by StageName asc
 | summarize Tasks=make_set(TaskName),DeploymentRing=make_set(deploymentRing),namespaceRingJSON=make_set(namespaceRingJSON) by StageName,YamlId;
-
 let runStageMap = BuildYamlMapSnapshot
 | extend PipelineUrl = strcat("https://dev.azure.com/",tolower(OrganizationName),"/",ProjectId,"/_build?definitionId=",DefinitionId,"&_a=summary")
 | join kind=inner recentRuns on PipelineUrl, BuildId
