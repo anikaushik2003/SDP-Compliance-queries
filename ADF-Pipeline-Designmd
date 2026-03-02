@@ -1,0 +1,315 @@
+## ADF Daily SDP Compliance Pipeline — Data Risks & Required Protections
+
+This document lists known data reliability and correctness issues that arise when operationalizing the SDP compliance Kusto queries into a **daily incremental ADF pipeline**, along with the engineering implications.
+The goal is to ensure historical correctness, idempotency, and recoverability.
+
+---
+
+# 1. Time Window & Late Data Issues
+
+## 1.1 Late Arriving Telemetry
+
+Kusto telemetry tables (`PipelineRecords`, `TimelineRecords`, `Logs`) ingest asynchronously.
+A pipeline run that occurred on **Day N** may appear in Kusto on **Day N+1 or later**.
+
+### Impact
+
+If the daily pipeline processes each day only once:
+
+* Some runs will be permanently missing from the fact table
+* Counts and compliance metrics will be understated
+
+### Required Design
+
+Implement a **sliding reprocessing window**:
+
+* Each daily run must process at least **D-2, D-1, and D**
+* Data must be UPSERTed (not appended)
+
+---
+
+## 1.2 Policy Evidence Lag
+
+Policy compliance data comes from the `Logs` table and frequently lands hours after the stage completes.
+
+### Impact
+
+A stage may exist today but its policy results may not appear until the next day.
+Without reprocessing:
+
+* Policy will be recorded as NULL/Missing permanently
+* Compliance reports become incorrect
+
+### Required Design
+
+Sliding window reprocessing (same as above).
+
+---
+
+## 1.3 Cross-Midnight Runs
+
+A pipeline run can start before midnight and complete after midnight.
+
+### Impact
+
+Different tables record different timestamps:
+
+* `PipelineRecords` (run)
+* `TimelineRecords` (stage)
+* `Logs` (policy)
+
+Daily slicing by timestamp can split a single run across multiple days, causing joins to fail.
+
+### Required Design
+
+Define a canonical **RunDate** based on the earliest `PipelineRecords` timestamp per `BuildId` and partition processing using that date.
+
+---
+
+## 1.4 Backfill After Outage
+
+If the ADF pipeline fails for multiple days and is rerun later, Kusto will now contain **more data** than was available on those original days (due to late ingestion).
+
+### Impact
+
+Reprocessing a past day will return additional rows compared to the original execution.
+
+### Required Design
+
+Backfill must be allowed and must be **idempotent** via MERGE/UPSERT.
+
+---
+
+# 2. Idempotency & Duplication Issues
+
+## 2.1 Duplicate Pipeline Runs
+
+ADF retries, manual reruns, or partial failures can execute the same day multiple times.
+
+### Impact
+
+Append-only sinks will double-count all stages.
+
+### Required Design
+
+The fact table must use:
+
+```
+UniqueStageId = AdoAccount|ProjectName|DefinitionId|BuildId|StageName
+```
+
+as a **primary merge key** and use UPSERT logic.
+
+---
+
+## 2.2 Partial Write Failures
+
+Pipeline may fail after writing some tables but before writing others.
+
+### Impact
+
+Data exists in inconsistent states across joins.
+
+### Required Design
+
+1. Write results to a staging table
+2. Perform a single atomic MERGE into the final fact table
+
+---
+
+## 2.3 Build Replay
+
+Azure DevOps telemetry may re-emit historical runs.
+
+### Impact
+
+Old `BuildId`s can reappear in Kusto and be ingested again.
+
+### Required Design
+
+UPSERT logic must overwrite existing rows when keys match.
+
+---
+
+## 2.4 YAML Snapshot Reprocessing
+
+`BuildYamlSnapshot` ingestion can be replayed, producing different parsed results for the same `YamlId`.
+
+### Impact
+
+Historical rows may change classification.
+
+### Required Design
+
+Cache stage metadata by `YamlId` and invalidate only when snapshot ingestion timestamp changes.
+
+---
+
+# 3. Join Consistency Issues
+
+## 3.1 Missing YAML Mapping
+
+`BuildYamlMapSnapshot` may lag `PipelineRecords`.
+
+### Impact
+
+Runs without `YamlId` are dropped by inner joins and never recovered.
+
+### Required Design
+
+Sliding window reprocessing to allow YAML mapping to appear later.
+
+---
+
+## 3.2 ServiceTree Snapshot Drift
+
+`ServiceTreeHierarchySnapshot_topicsnapshot` reflects **current ownership**, not historical ownership.
+
+### Impact
+
+Reprocessing historical data assigns runs to the wrong team/organization.
+
+### Required Design
+
+Persist service metadata (Division, Org, ServiceGroup, TeamGroup, Owner) into the fact table at ingestion time.
+
+---
+
+## 3.3 Delayed Stage Telemetry
+
+`TimelineRecords` ingestion can lag `PipelineRecords`.
+
+### Impact
+
+Stages appear without policy or health data and are interpreted as failures or missing.
+
+### Required Design
+
+Sliding window reprocessing and a freshness indicator column.
+
+---
+
+# 4. Classification Instability
+
+## 4.1 Service-Level Classification (Non-Incremental)
+
+Fields such as:
+
+* isCosmicService
+* Ev2ServiceType
+
+depend on observing **all pipelines for a service across the entire time range**.
+
+### Impact
+
+Historical classifications can change when new pipelines appear.
+
+### Required Design
+
+Move service classification to a **separate periodically rebuilt dimension table**, not the daily fact load.
+
+---
+
+## 4.2 Below-ARM Detection
+
+Below-ARM pipeline exclusion is derived from scanning all `TimelineRecords`.
+
+### Impact
+
+Pipeline classification may change if template usage changes.
+
+### Required Design
+
+Compute periodically and store as a reference table reused by daily runs.
+
+---
+
+# 5. Operational Scheduling Issues
+
+## 5.1 Parallel Backfill Collisions
+
+Backfilling multiple days in parallel can cause overlapping writes to the same `BuildId`.
+
+### Required Design
+
+Partition MERGE operations by RunDate or serialize backfill execution.
+
+---
+
+## 5.2 Clock Skew
+
+ADF time and Kusto `now()` are not guaranteed identical.
+
+### Impact
+
+Near-midnight runs may be excluded.
+
+### Required Design
+
+Never use `now()` in queries.
+ADF must pass explicit `startDate` and `endDate` parameters.
+
+---
+
+## 5.3 Query Retries
+
+Kusto throttling or memory pressure causes ADF retries.
+
+### Impact
+
+Duplicate ingestion if sink is append-only.
+
+### Required Design
+
+Idempotent MERGE sink required.
+
+---
+
+# 6. Data Quality Interpretation Issues
+
+## 6.1 NULL vs NotEnabled
+
+Policy status "Missing" may represent:
+
+* delayed logs
+* join failure
+* actual missing policy
+
+### Required Design
+
+Add a `DataFreshness` or `PolicyObserved` indicator column.
+
+---
+
+## 6.2 Ring Extraction Failures
+
+Ring values are parsed from YAML task inputs. Template changes can silently break parsing.
+
+### Impact
+
+All stages may appear to have empty rings.
+
+### Required Design
+
+Add monitoring metric:
+
+* % of stages with empty Ring per day
+
+Alert when abnormal.
+
+---
+
+# 7. Required Core Safeguards (Summary)
+
+The pipeline must include:
+
+1. Sliding 3-day reprocessing window
+2. Parameterized date ranges (no `now()`)
+3. Staging table + atomic MERGE
+4. UniqueStageId primary key UPSERT
+5. Persisted service metadata
+6. Cached stageData by YamlId
+7. Separate service classification dimension
+8. Policy freshness indicator
+9. Backfill capability
+10. Monitoring for parsing failures
