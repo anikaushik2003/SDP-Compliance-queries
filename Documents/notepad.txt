@@ -1,0 +1,23 @@
+1. maximum lag for ingestion
+    - BuildYaml source table
+    - BuildYamlSnapshot -> 1day
+    - Logs table
+    - Pipeline records has data, but policy data has not come yet
+    - Multi day runs -> stage at day 1+n  should be appended to its run starting on day 1.
+        - stage gets appended to corresponding pipeline based on url.
+
+2. we should add ingest date to timeline records and pipeline records
+3. PipelineRecords, Logs and TimelineRecords -> what is the maximum delay for ingestion in these tables. is there a backfilling procedure or do some runs get missed.
+
+2. Why did we move from BuildYaml to Logs/M365Gating normalized tables
+3. Moving from Logs to M365Gating normalized tables
+
+4. Move alternatives section further below.
+
+5. add info: basis for delete during sliding window
+
+6. servicetree snapshots are currently not updated.
+
+
+
+5th -> 11th

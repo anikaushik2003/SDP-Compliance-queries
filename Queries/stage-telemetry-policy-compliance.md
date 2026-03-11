@@ -25,7 +25,10 @@ let stages =
                               ),
         Tasks               = make_set(tostring(parse_json(Task).Name)),
         Task_Ids            = make_set(tostring(parse_json(Task).Id)),
-        TaskNames           = make_set(tostring(parse_json(Task).Name))
+        TaskNames           = make_set(tostring(parse_json(Task).Name)),
+        HasLockbox          = max(iff(tostring(parse_json(Task).Name) == "lockbox-approval-request-prod_with_onebranch", 1, 0)),
+        HasClassic          = max(iff(tostring(parse_json(Task).Name) == "ExpressV2Internal", 1, 0)),
+        HasRA               = max(iff(tostring(parse_json(Task).Name) == "Ev2RARollout", 1, 0))
       by AdoAccount, ProjectId, Id, HostType, Environment, Version
     | extend isSuccessful = (totalRecords == successfulRecords)
     | extend StageName = iff(
@@ -133,4 +136,5 @@ StageTelemetry_PolicyCompliance // 558k
         RingBakeTime_Status, RingProgression_Status,
         StageBakeTime_Status, MinStageCount_Status,
         HealthEnabled, HealthCheckPassed, StageName, UniqueStageId,
-        Ring, Namespace, Cloud, DeploymentType, Trainset, isCosmicStage
+        Ring, Namespace, Cloud, DeploymentType, Trainset, isCosmicStage,
+        HasLockbox, HasClassic, HasRA
