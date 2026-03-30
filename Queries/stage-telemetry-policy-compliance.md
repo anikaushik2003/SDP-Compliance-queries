@@ -3,6 +3,27 @@ set norequesttimeout;
 set servertimeout = 1h;
 set maxmemoryconsumptionperiterator=32212254720;
 let timeSpan = 60d;
+// Workload Info
+let sglist = dynamic(["IC3","Yammer","TAOS","O365 FAST","Substrate Platform","Mesh","Microsoft Search Assistants & Intelligence (MSAI)","O365 Enterprise Cloud","Microsoft Teams"]);
+let orglist = dynamic(["WebXT","OPG","OneDrive/SharePoint","Data Security and Privacy"]);
+let ServiceTree = ServiceTreeHierarchySnapshot
+| where Level == "Service" and ServiceId != ""
+| project DivisionName, OrganizationName, ServiceGroupName, TeamGroupName, ServiceName, ServiceId
+| extend Workload = iif(ServiceGroupName in (sglist),ServiceGroupName,iif(OrganizationName in (orglist),OrganizationName,iif(OrganizationName has "W+D","W+D",OrganizationName)))
+| distinct ServiceId, Workload, DivisionName, OrganizationName, ServiceGroupName, TeamGroupName, ServiceName
+| join kind = leftouter (ServiceTreeSnapshot
+| distinct ServiceId, DevOwner) on ServiceId
+| distinct ServiceId, Workload=iff(Workload == "Skype","M365 Core -IC3",iff(Workload == "Microsoft Teams","CAP - Microsoft Teams",Workload)), DevOwner, DivisionName, OrganizationName, ServiceGroupName, TeamGroupName, ServiceName;
+// Ring Workload Info
+let ringworkload = datatable(Workload:string, AllowedRings:dynamic)[
+"M365 Core - IC3", dynamic(["NPE","TDF", "SDF", "MSIT", "GENERAL"]),
+"OPG", dynamic(["TEST", "SDF", "MSIT", "PROD", "GCC", "GCCH", "DOD", "GALLATIN", "AG08", "AG09"]),
+"CAP - Microsoft Teams", dynamic(["TEST", "DOGFOOD", "MSFT", "PROD", "GCC", "GCCH", "DOD", "GALLATIN", "AG08", "AG09"]),
+"Substrate Platform", dynamic(["TEST", "SDF", "MSIT", "PROD", "GCC", "GCCH", "DOD", "GALLATIN", "AG08", "AG09"]),
+"Others", dynamic(["TEST", "SDF", "MSIT", "PROD", "GCC", "GCCH", "DOD", "GALLATIN", "AG08", "AG09"])
+];
+let ringworkloadlist = ringworkload
+| summarize make_set(Workload);
 let GetVersionInfo = PipelineRecords
 | project Timestamp=todatetime(Timestamp),AdoAccount,ProjectId,DefinitionId, ProjectName, ServiceId = ServiceTreeGuid, Environment, Version,Id
 | where  Timestamp between (now()-timeSpan..now())
@@ -131,10 +152,16 @@ StageTelemetry_PolicyCompliance // 558k
         strcat_array(array_slice(split(Environment, "_"), 1, -1), "_")
       )
     | extend UniqueStageId = strcat(tolower(AdoAccount),"|", tolower(ProjectName),"|",tostring(DefinitionId),"|", Id, "|", StageName)
+    // --- ServiceTree enrichment for Onboarded calculation ---
+    | join kind=leftouter ServiceTree on ServiceId
+    | extend ringworkload = iff(Workload has_any (ringworkloadlist), Workload, "Others")
+    | join kind=leftouter ringworkload on $left.ringworkload == $right.Workload
+    | extend Onboarded = iff(Ring == "", 0, iff(AllowedRings has Ring, 1, 0))
     | project
         AdoAccount, ProjectName, DefinitionId, Id, Environment, PipelineUrl,
         RingBakeTime_Status, RingProgression_Status,
         StageBakeTime_Status, MinStageCount_Status,
         HealthEnabled, HealthCheckPassed, StageName, UniqueStageId,
         Ring, Namespace, Cloud, DeploymentType, Trainset, isCosmicStage,
-        HasLockbox, HasClassic, HasRA
+        HasLockbox, HasClassic, HasRA, Onboarded,
+        ServiceId, Workload, DevOwner, DivisionName, OrganizationName, ServiceGroupName, TeamGroupName, ServiceName

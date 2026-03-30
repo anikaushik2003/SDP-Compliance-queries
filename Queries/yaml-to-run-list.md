@@ -62,16 +62,20 @@ let abovearmMOBRpipelines = allmobrpipelines
 | distinct PipelineUrl, BuildId=tolong(Id), Environment, ServiceTreeGuid, StageName; // in 60 days, about 5,64,437 records for all runs
 // Stage-level ServiceId mapping (ServiceId can be overridden per stage via templateContext.serviceTreeId)
 // PipelineRecords has one row per (run, stage/environment) with the effective ServiceId for that stage
-let OnlyabovearmMOBRpipelinesList = abovearmMOBRpipelines
-| distinct PipelineUrl
-| summarize make_set(PipelineUrl);
 let RecentRuns =
 abovearmMOBRpipelines
 | project PipelineUrl, BuildId;
 // Get YAML ID's for Last Run only - used to extract CURRENT stage definitions (no leftover stages)
-let yamlToRunList = BuildYamlMapSnapshot // this returns 6052 rows over 60days
-| extend PipelineUrl = strcat("https://dev.azure.com/",tolower(OrganizationName),"/",ProjectId,"/_build?definitionId=",DefinitionId,"&_a=summary")
-| join kind=leftsemi RecentRuns
-    on PipelineUrl, $left.BuildId == $right.BuildId
-| project PipelineUrl, BuildId, YamlId;
+let yamlToRunList = RecentRuns
+  | join kind=inner (
+      BuildYamlMapSnapshot
+      | extend PipelineUrl = strcat("https://dev.azure.com/",tolower(OrganizationName),"/",ProjectId,"/_build?definitionId=",DefinitionId,"&_a=summary")
+      | project PipelineUrl, BuildId, YamlId
+  ) on PipelineUrl, BuildId
+  | join kind=leftouter (
+      BuildYamlSnapshot
+      | where Index == 0
+      | distinct YamlId, PipelineName = DisplayName
+  ) on YamlId
+  | project PipelineUrl, BuildId, YamlId, PipelineName;
 yamlToRunList

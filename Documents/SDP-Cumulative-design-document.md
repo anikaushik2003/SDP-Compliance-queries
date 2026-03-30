@@ -145,21 +145,22 @@ Defines the universe of in-scope stages. Filters to above-ARM MOBR pipelines, ex
 
 **Primary Key:** `(PipelineUrl, BuildId, StageName)` / `UniqueStageId`
 
-#### Table 2: yaml-to-run-list (Bridge)
+#### Table 2: yaml-to-run-list (Bridge + Pipeline Name)
 
-Maps each run to its YAML definition. Enrichment only — no downstream join depends on YamlId.
+Maps each run to its YAML definition and pipeline display name. Enrichment only — no downstream join depends on YamlId.
 
 | Column | Type | Description |
 |---|---|---|
 | PipelineUrl | string | ADO pipeline URL |
 | BuildId | long | Run/build identifier |
-| YamlId | string | YAML definition identifier |
+| YamlId | string | YAML definition identifier from BuildYamlMapSnapshot |
+| PipelineName | string | Pipeline display name from BuildYamlSnapshot (Index == 0) |
 
 **Primary Key:** `(PipelineUrl, BuildId)`
 
-#### Table 3: stage-telemetry-policy-compliance (Runtime Enrichment)
+#### Table 3: stage-telemetry-policy-compliance (Runtime Enrichment + ServiceTree)
 
-All runtime data: policy compliance, health checks, stage properties, and task classification flags. Sourced from Logs and TimelineRecords.
+All runtime data: policy compliance, health checks, stage properties, task classification flags, ServiceTree enrichment, and stage onboarding status. Sourced from Logs, TimelineRecords, PipelineRecords (via GetVersionInfo), ServiceTreeHierarchySnapshot, and ServiceTreeSnapshot.
 
 | Column | Type | Description |
 |---|---|---|
@@ -178,66 +179,40 @@ All runtime data: policy compliance, health checks, stage properties, and task c
 | DeploymentType | string | Normal / Emergency / GlobalOutage |
 | Trainset | string | Trainset ID |
 | isCosmicStage | int | 1 if COSMIC ring data exists |
-| HasLockbox | int | 1 if Lockbox task present (sourced from TimelineRecords runtime data) |
-| HasClassic | int | 1 if ExpressV2Internal (Classic EV2) task present (sourced from TimelineRecords runtime data) |
-| HasRA | int | 1 if Ev2RARollout task present (sourced from TimelineRecords runtime data) |
+| HasLockbox | int | 1 if Lockbox task present (from TimelineRecords runtime data) |
+| HasClassic | int | 1 if ExpressV2Internal task present (from TimelineRecords runtime data) |
+| HasRA | int | 1 if Ev2RARollout task present (from TimelineRecords runtime data) |
+| Onboarded | int | 1 if Ring is non-empty AND in workload's AllowedRings; 0 otherwise |
+| ServiceId | string | ServiceTree GUID (from GetVersionInfo) |
+| Workload | string | Computed workload grouping (from ServiceTree hierarchy) |
+| DevOwner | string | Dev owner from ServiceTree |
+| DivisionName | string | Division from ServiceTree hierarchy |
+| OrganizationName | string | Organization from ServiceTree hierarchy |
+| ServiceGroupName | string | Service group from ServiceTree hierarchy |
+| TeamGroupName | string | Team group from ServiceTree hierarchy |
+| ServiceName | string | Service name from ServiceTree hierarchy |
 
 **Primary Key:** `UniqueStageId`
 
-**Note:** HasLockbox, HasClassic, and HasRA are deliberately sourced from TimelineRecords (runtime task detection) rather than YAML definitions. This is a change from the old query, which derived these from YAML. Runtime detection is more accurate because it reflects what actually executed, not what was defined.
+**Notes:**
+- HasLockbox, HasClassic, and HasRA are sourced from TimelineRecords (runtime), not YAML definitions. Runtime detection reflects what actually executed.
+- Onboarded is computed using ServiceTree enrichment (ServiceId → Workload) and a ringworkload datatable (Workload → AllowedRings). Both are resolved within this query.
 
 ### 8.3 Assembly Order
 
-```
-Step 1:  all-stage-runs
-              |
-              | LEFT OUTER JOIN yaml-to-run-list ON (PipelineUrl, BuildId)
-              v
-         + YamlId per row (NULL if no YAML mapping)
-              |
-Step 2:       | LEFT OUTER JOIN stage-telemetry-policy-compliance ON UniqueStageId
-              v
-         + All runtime enrichment columns (NULL if no telemetry)
-              |
-Step 3:       | LEFT OUTER JOIN ServiceTree snapshot ON ServiceTreeGuid
-              v
-         + Workload, DivisionName, OrganizationName, ServiceGroupName,
-           TeamGroupName, ServiceName, DevOwner
-```
+![assembly_order](assembly_order.png)
 
-**Step 1** is left outer because YamlId is purely enrichment metadata — no downstream table uses it as a join key.
-**Step 2** is left outer because not all stages have runtime telemetry — the SDP policy task may not have run yet.
-**Step 3** is left outer because some ServiceTreeGuids may not resolve to a known service entry.
-
-The final materialized table includes all columns from the 3-table join plus the following ServiceTree enrichment columns from Step 3:
-
-| Column | Type | Description |
-|---|---|---|
-| Workload | string | Service workload name |
-| DivisionName | string | Division from ServiceTree hierarchy |
-| OrganizationName | string | Organization from ServiceTree hierarchy |
-| ServiceGroupName_ST | string | Service group from ServiceTree (distinct from PipelineRecords) |
-| TeamGroupName | string | Team group from ServiceTree hierarchy |
-| ServiceName | string | Service name from ServiceTree hierarchy |
-| DevOwner | string | Dev owner from ServiceTree hierarchy |
-| TelemetryPresent | int | 1 when stage-telemetry data exists, 0 otherwise |
+**Step 1** is left outer because YamlId and PipelineName are purely enrichment metadata — no downstream table uses them as join keys.
+**Step 2** is left outer because not all stages have runtime telemetry — the SDP policy task may not have run, or log entries may be missing. Keep the stage row, leave enrichment columns NULL.
 
 ### 8.4 Incremental Processing Design
 
 All 3 tables support daily incremental processing. Each day's slice is self-contained:
 
-```
-Day 1:  process(day1) → Result₁ → Table = Result₁
-Day 2:  process(day2) → Result₂ → Table = Table ∪ Result₂
-Day 3:  process(day3) → Result₃ → Table = Table ∪ Result₃
-...
-Day X:  process(dayX) → Resultₓ → Table = Table ∪ Resultₓ
-```
+![incremental_processing](incremental_processing.png)
 
 Where `process(dayN)` is:
-```
-all-stage-runs(1d) → join yaml-to-run-list(1d) → join policy-compliance(1d) → ResultN
-```
+![day_n_processing](day_n_processing.png)
 
 **Why this works:**
 - `(PipelineUrl, BuildId)` — a BuildId belongs to exactly one day
@@ -247,45 +222,13 @@ all-stage-runs(1d) → join yaml-to-run-list(1d) → join policy-compliance(1d) 
 **What cannot be done incrementally:**
 - **Service-level classification** (isCosmicService, Ev2ServiceType) — aggregates across ALL pipelines for a ServiceId over the full window. Requires a periodic recompute pass over the full accumulated table.
 
-### 8.5 Alternatives Considered
-
-| Approach | Why Rejected |
-|---|---|
-| In-query optimization | 8 attempts, all timed out at ~252s. The join scale fundamentally exceeds ADX interactive limits. |
-| Spark / Fabric Lakehouse | Requires language rewrite (KQL → PySpark), new infrastructure provisioning. Overkill for ~570 MB compressed data. |
-| ADX Update Policies | Designed for per-record enrichment, not global reconciliation across multiple asynchronous sources. |
-| ADX Continuous Export | Targets external storage (ADLS, Blob), cannot write to another ADX table. |
-| Daily windowing on the monolithic query | Joins are interdependent — service classification needs all days, "latest YAML" retroactively affects all runs. Cannot partition by day. |
-| Full replace daily | Correct but expensive — recomputes entire 60-day window daily (~7.6M rows). Not needed when only 1 day of new data arrives. |
-
 ---
 
 ## 9. ADF Pipeline Design
 
 ### Daily Pipeline Flow
 
-```
-Trigger (daily, 04:00 UTC)
-    |
-    v
-Run all-stage-runs(2d window) → staging table
-    |
-    v
-Run yaml-to-run-list(2d window) → staging table
-    |
-    v
-Run stage-telemetry-policy-compliance(2d window) → staging table
-    |
-    v
-Join 3 staging tables → joined result
-    |
-    v
-Delete existing rows for reprocessing window:
-  .delete from SDPMaterialized where Timestamp between (startDate .. endDate)
-    |
-    v
-Append fresh joined result via .set-or-append into SDPMaterialized
-```
+![ADF_Daily_Pipeline_Flow](ADF_Daily_Pipeline_Flow.png)
 
 ### Key Risk Mitigations
 
@@ -335,6 +278,18 @@ At pipeline start, drop any staging tables left over from prior failed runs befo
 **s360prodro SDP action items:** Wave classification (e.g., "Wave 8") from `cluster('s360prodro').database('service360db')` can be added as an additional left-outer join enrichment on PipelineUrl. Small dataset, minimal cross-cluster overhead.
 
 ---
+
+## 12. Alternatives Considered
+
+| Approach | Reason for Rejection |
+|---|---|
+| In-query optimization | 8 attempts, all timed out at ~252s. The join scale fundamentally exceeds ADX interactive limits. |
+| Spark / Fabric Lakehouse | Requires language rewrite (KQL → PySpark), new infrastructure provisioning. Overkill for ~570 MB compressed data. |
+| ADX Update Policies | Designed for per-record enrichment, not global reconciliation across multiple asynchronous sources. |
+| ADX Continuous Export | Targets external storage (ADLS, Blob), cannot write to another ADX table. |
+| Daily windowing on the monolithic query | Joins are interdependent — service classification needs all days, "latest YAML" retroactively affects all runs. Cannot partition by day. |
+| Full replace daily | Correct but expensive — recomputes entire 60-day window daily (~7.6M rows). Not needed when only 1 day of new data arrives. |
+
 
 ## 12. Open Questions
 

@@ -5,7 +5,7 @@
 ## Table 1: all-stage-runs (Central Fact Table — Scoping)
 
 **Source file:** `all-stage-runs.md`
-**Description:** All above-ARM MOBR pipeline stage-level run records (last 60 days). Defines the universe of in-scope stages. Filters out test accounts, AAD, below-ARM pipelines, and excluded ServiceTreeGuids.
+**Description:** All above-ARM MOBR pipeline stage-level run records (last 60 days). Defines the universe of in-scope stages. Filters out test accounts, AAD, below-ARM pipelines, and excluded ServiceTreeGuids. The `exemptedPipelines` filter must also be applied here (or as a post-join filter) to exclude known-exempt pipelines.
 **Grain:** One row per stage per run per pipeline.
 
 | Column | Type | Description |
@@ -27,15 +27,15 @@ Equivalently: `UniqueStageId`
 
 | FK Columns | Joins To | Join Type | Purpose |
 |---|---|---|---|
-| (PipelineUrl, BuildId) | yaml-to-run-list | left outer | Add YamlId to each run |
-| UniqueStageId | stage-telemetry-policy-compliance | left outer | Add runtime enrichment + policy statuses |
+| (PipelineUrl, BuildId) | yaml-to-run-list | left outer | Add YamlId, PipelineName to each run |
+| UniqueStageId | stage-telemetry-policy-compliance | left outer | Add runtime enrichment + policy statuses + ServiceTree + Onboarded |
 
 ---
 
-## Table 2: yaml-to-run-list (YAML Bridge Table)
+## Table 2: yaml-to-run-list (YAML Bridge + Pipeline Name)
 
 **Source file:** `yaml-to-run-list.md`
-**Description:** Maps each pipeline run (BuildId) to its YAML definition (YamlId). One YAML per build.
+**Description:** Maps each pipeline run (BuildId) to its YAML definition (YamlId) and pipeline display name. Enrichment only — no downstream join depends on YamlId.
 **Grain:** One row per run per pipeline.
 
 | Column | Type | Description |
@@ -43,6 +43,7 @@ Equivalently: `UniqueStageId`
 | PipelineUrl | string | ADO pipeline URL |
 | BuildId | long | Run/build identifier |
 | YamlId | string | YAML definition identifier from BuildYamlMapSnapshot |
+| PipelineName | string | Pipeline display name from BuildYamlSnapshot (Index == 0) |
 
 **Primary Key:** `(PipelineUrl, BuildId)`
 
@@ -50,16 +51,16 @@ Equivalently: `UniqueStageId`
 
 | FK Columns | Joins To | Join Type | Purpose |
 |---|---|---|---|
-| (PipelineUrl, BuildId) | all-stage-runs | left outer | Bridge: connect runs to their YAML |
+| (PipelineUrl, BuildId) | all-stage-runs | left outer | Bridge: connect runs to their YAML + pipeline name |
 
 **Relationship:** Each (PipelineUrl, BuildId) maps to exactly one YamlId. Multiple BuildIds can share the same YamlId (same YAML used across runs).
 
 ---
 
-## Table 3: stage-telemetry-policy-compliance (Runtime Enrichment)
+## Table 3: stage-telemetry-policy-compliance (Runtime Enrichment + ServiceTree)
 
 **Source file:** `stage-telemetry-policy-compliance.md`
-**Description:** Per-stage runtime data combining policy compliance results (from Logs), health check status (from TimelineRecords), stage properties (ring, namespace, cloud, deploymentType, trainset from Logs), and task classification flags (HasLockbox, HasClassic, HasRA from TimelineRecords).
+**Description:** Per-stage runtime data combining: policy compliance results (from Logs), health check status (from TimelineRecords), stage properties (ring, namespace, cloud, deploymentType, trainset from Logs), task classification flags (HasLockbox, HasClassic, HasRA from TimelineRecords), ServiceTree enrichment (Workload, DivisionName, etc.), and stage onboarding status (Onboarded, computed from Ring + Workload's AllowedRings).
 **Grain:** One row per stage per run per pipeline.
 
 | Column | Type | Description |
@@ -91,6 +92,17 @@ Equivalently: `UniqueStageId`
 | HasLockbox | int (0/1) | Stage has lockbox-approval-request-prod_with_onebranch task |
 | HasClassic | int (0/1) | Stage has ExpressV2Internal (Classic EV2) task |
 | HasRA | int (0/1) | Stage has Ev2RARollout (RA EV2) task |
+| **Onboarding** | | |
+| Onboarded | int (0/1) | 1 if Ring is non-empty AND Ring is in the workload's AllowedRings list; 0 otherwise |
+| **ServiceTree enrichment** (via ServiceId from GetVersionInfo) | | |
+| ServiceId | string | ServiceTree GUID |
+| Workload | string | Computed workload grouping (from ServiceTree hierarchy) |
+| DevOwner | string | Dev owner from ServiceTree |
+| DivisionName | string | Division from ServiceTree hierarchy |
+| OrganizationName | string | Organization from ServiceTree hierarchy |
+| ServiceGroupName | string | Service group from ServiceTree hierarchy |
+| TeamGroupName | string | Team group from ServiceTree hierarchy |
+| ServiceName | string | Service name from ServiceTree hierarchy |
 
 **Primary Key:** `UniqueStageId`
 
@@ -98,12 +110,16 @@ Equivalently: `UniqueStageId`
 
 | FK Columns | Joins To | Join Type | Purpose |
 |---|---|---|---|
-| UniqueStageId | all-stage-runs.UniqueStageId | left outer | Enrich scoped stage runs with all runtime data |
+| UniqueStageId | all-stage-runs.UniqueStageId | left outer | Enrich scoped stage runs with all runtime + ServiceTree data |
 
 **Data sources within this query:**
 - **Logs** (3 message types): PolicyEvidenceRecord → policy statuses; MOBR API URL → Ring, Cloud, DeploymentType, Trainset; Cosmic log → CosmicRing, CosmicNamespace
 - **TimelineRecords**: HealthEnabled, HealthCheckPassed, HasLockbox, HasClassic, HasRA
-- **PipelineRecords** (via GetVersionInfo lookup): Version, ServiceId (for StageName derivation)
+- **PipelineRecords** (via GetVersionInfo lookup): Version, ServiceId (for StageName derivation + ServiceTree join)
+- **ServiceTreeHierarchySnapshot + ServiceTreeSnapshot**: Workload, DivisionName, OrganizationName, ServiceGroupName, TeamGroupName, ServiceName, DevOwner
+- **ringworkload datatable**: AllowedRings per Workload (for Onboarded computation)
+
+**Note:** HasLockbox, HasClassic, and HasRA are deliberately sourced from TimelineRecords (runtime task detection) rather than YAML definitions. Runtime detection is more accurate because it reflects what actually executed, not what was defined.
 
 ---
 
@@ -111,7 +127,7 @@ Equivalently: `UniqueStageId`
 
 ```
     yaml-to-run-list
-   (PipelineUrl, BuildId, YamlId)
+   (PipelineUrl, BuildId, YamlId, PipelineName)
             |
    JOIN ON: (PipelineUrl, BuildId)
             |
@@ -120,13 +136,17 @@ Equivalently: `UniqueStageId`
     (PipelineUrl,                       (UniqueStageId,
      BuildId,        JOIN ON:            Ring, Namespace, Cloud,
      StageName,      UniqueStageId       DeploymentType, Trainset,
-     ServiceTreeGuid,                    isCosmicStage,
+     ServiceTreeGuid,                    isCosmicStage, Onboarded,
      UniqueStageId,                      HasLockbox, HasClassic, HasRA,
      AdoAccount,                         RingBakeTime_Status,
      ProjectId,                          RingProgression_Status,
      ProjectName)                        StageBakeTime_Status,
                                          MinStageCount_Status,
-                                         HealthEnabled, HealthCheckPassed)
+                                         HealthEnabled, HealthCheckPassed,
+                                         ServiceId, Workload, DevOwner,
+                                         DivisionName, OrganizationName,
+                                         ServiceGroupName, TeamGroupName,
+                                         ServiceName)
 ```
 
 ---
@@ -138,18 +158,20 @@ Step 1:  all-stage-runs
               |
               | LEFT OUTER JOIN yaml-to-run-list ON (PipelineUrl, BuildId)
               v
-         + YamlId per row
+         + YamlId, PipelineName per row
               |
 Step 2:       | LEFT OUTER JOIN stage-telemetry-policy-compliance ON UniqueStageId
               v
          + Ring, Namespace, Cloud, DeploymentType, Trainset, isCosmicStage,
-           HasLockbox, HasClassic, HasRA,
+           HasLockbox, HasClassic, HasRA, Onboarded,
            RingBakeTime_Status, RingProgression_Status,
            StageBakeTime_Status, MinStageCount_Status,
-           HealthEnabled, HealthCheckPassed
+           HealthEnabled, HealthCheckPassed,
+           ServiceId, Workload, DevOwner, DivisionName, OrganizationName,
+           ServiceGroupName, TeamGroupName, ServiceName
 ```
 
-**Step 1** is left outer because YamlId is now purely enrichment metadata — it is not a join key for any downstream table. Runs without a YamlId in BuildYamlMapSnapshot are kept with a NULL YamlId.
+**Step 1** is left outer because YamlId and PipelineName are purely enrichment metadata — no downstream table uses them as join keys. Runs without a match in BuildYamlMapSnapshot are kept with NULL values.
 **Step 2** is left outer because not all stages have runtime telemetry — the SDP policy task may not have run, or log entries may be missing. Keep the stage row, leave enrichment columns NULL.
 
 ---
@@ -176,18 +198,20 @@ Step 2:       | LEFT OUTER JOIN stage-telemetry-policy-compliance ON UniqueStage
 
 ## Notes and Callouts
 
-1. **Type mismatch on BuildId:** `BuildId` in all-stage-runs is `long`; `Id` in stage-telemetry-policy-compliance is `string` (cast on line 92). If joining on (PipelineUrl, BuildId, StageName) instead of UniqueStageId, one side needs a cast (`tolong(Id)` or `tostring(BuildId)`).
+1. **Type mismatch on BuildId:** `BuildId` in all-stage-runs is `long`; `Id` in stage-telemetry-policy-compliance is `string`. If joining on (PipelineUrl, BuildId, StageName) instead of UniqueStageId, one side needs a cast.
 
 2. **Join type rationale:**
-   - **Step 1 (left outer):** YamlId is purely enrichment metadata — no downstream table uses it as a join key. Runs without a YamlId are kept with NULL YamlId.
-   - **Step 2 (left outer):** Policy telemetry depends on the SDP policy task emitting a `[PolicyEvidenceRecord]` log entry, and runtime task data depends on TimelineRecords. Stages where these haven't run or were skipped will have no match — keep the row, leave enrichment columns NULL.
+   - **Step 1 (left outer):** YamlId and PipelineName are purely enrichment metadata — no downstream table uses them as join keys. Runs without a YamlId are kept with NULL values.
+   - **Step 2 (left outer):** Policy telemetry, health checks, ServiceTree enrichment, and Onboarded status all depend on runtime data existing. Stages where telemetry hasn't arrived yet will have NULL enrichment columns.
 
 3. **Role separation:**
    - **all-stage-runs** = scoping ("which stages exist in the MOBR universe")
-   - **yaml-to-run-list** = bridge ("which YAML goes with which run")
-   - **stage-telemetry-policy-compliance** = enrichment ("what happened at runtime")
+   - **yaml-to-run-list** = bridge + metadata ("which YAML and pipeline name per run")
+   - **stage-telemetry-policy-compliance** = enrichment ("what happened at runtime + ServiceTree + onboarding status")
 
-   all-stage-runs cannot be replaced by policy-compliance because: (a) policy-compliance has no MOBR/above-ARM scoping filters, (b) policy-compliance only has data for stages where telemetry exists — stages with no log entries would be lost, (c) ServiceTreeGuid and ServiceGroupName are only in all-stage-runs.
+   all-stage-runs cannot be replaced by policy-compliance because: (a) policy-compliance has no MOBR/above-ARM scoping filters, (b) policy-compliance only has data for stages where telemetry exists — stages with no log entries would be lost, (c) ServiceTreeGuid (from PipelineRecords) and ServiceGroupName (from PipelineRecords) are only in all-stage-runs.
+
+4. **Onboarded computation:** `Onboarded = iff(Ring == "", 0, iff(AllowedRings has Ring, 1, 0))`. This requires ServiceTree enrichment (ServiceId → Workload) and the ringworkload datatable (Workload → AllowedRings). Both are now computed within stage-telemetry-policy-compliance.
 
 ---
 
@@ -200,8 +224,8 @@ All 3 tables and their joins support daily incremental processing. The full X-da
 | Table | Partitionable by day? | Why |
 |---|---|---|
 | all-stage-runs | Yes | PipelineRecords filtered by `Timestamp between (now()-1d..now())`. Each day's slice gives that day's runs. UNION daily slices = full X days. |
-| yaml-to-run-list | Yes | Each run maps to exactly one YamlId. Per-run, no cross-day dependency. |
-| stage-telemetry-policy-compliance | Yes | Logs filtered by `Timestamp > ago(1d)`. Each record is per stage per run. No cross-day dependency. |
+| yaml-to-run-list | Yes | Each run maps to exactly one YamlId + PipelineName. Per-run, no cross-day dependency. |
+| stage-telemetry-policy-compliance | Yes | Logs filtered by `Timestamp > ago(1d)`. Each record is per stage per run. ServiceTree and ringworkload are snapshot/static tables — no cross-day dependency. |
 
 ### Why Joins Work Per-Day
 
@@ -261,4 +285,136 @@ On day 1 you might see 2 of a service's 5 pipelines and classify it as "RS Only"
 
 **belowarmpipelines exclusion** — scans ALL TimelineRecords (no time filter) to build a PipelineUrl exclusion set. This is a stable pipeline-level property (pipelines don't flip between above/below ARM day to day), so compute it once and reuse across all daily slices. Minor concern only.
 
-All other downstream enrichments (PipelineOnboarded, Onboarded, exempted_pipelines, ServiceTree lookup) are per-run, per-YAML, or static — all fine incrementally.
+All other downstream enrichments (PipelineOnboarded, exempted_pipelines) are per-run or static — all fine incrementally.
+
+---
+
+## External Table: GatingRequestMetrics
+
+**Cluster:** `m365gating-kusto-prod.centralus`
+**Database:** `M365GatingAnalytics`
+**Table:** `GatingRequestMetrics`
+**Description:** Gating request metrics for M365 pipelines, capturing per-stage gating compliance status and metadata.
+
+| # | Column | Type | Description |
+|---|---|---|---|
+| 0 | CorrelationId | string | Correlation identifier for the gating request |
+| 1 | InsertedAt | datetime | Timestamp when the record was inserted |
+| 2 | MetricCreationTime | datetime | Timestamp when the metric was created |
+| 3 | OrganizationName | string | Azure DevOps organization/account name (same as AdoAccount) |
+| 4 | ProjectName | string | ADO project name |
+| 5 | ProjectId | string | ADO project GUID |
+| 6 | DefinitionId | string | Pipeline definition ID |
+| 7 | BuildId | string | Run/build identifier |
+| 8 | ServiceTreeId | string | ServiceTree GUID |
+| 9 | StageName | string | Deployment stage name |
+| 10 | StageAttempt | string | Stage attempt number |
+| 11 | JobAttempt | string | Job attempt number |
+| 12 | Cloud | string | Target cloud environment |
+| 13 | IsProduction | bool | Whether this is a production deployment |
+| 14 | GateType | string | Type of gate applied |
+| 15 | OverallGatingCompliantStatus | string | Overall gating compliance status |
+| 16 | Metadata | dynamic | Additional metadata (JSON) |
+
+**Cols to be added:**
+
+| Column | Type | Description |
+|---|---|---|
+| Trainset | string | Trainset ID |
+| DeploymentType | string | Deployment type |
+| Ring | string | Deployment ring |
+| Namespace | string | COSMIC namespace, or "Non-Cosmic" |
+| isCosmicService | int (0/1) | 1 if service has COSMIC pipelines |
+| Ev2ServiceType | string | EV2 service classification (e.g. "RS Only", "RA Only", "Hybrid") |
+
+---
+
+## External Table: RuleExecutionMetrics
+
+**Cluster:** `m365gating-kusto-prod.centralus`
+**Database:** `M365GatingAnalytics`
+**Table:** `RuleExecutionMetrics`
+**Description:** Per-build rule execution results, capturing whether a policy ran and passed along with associated data and metadata.
+
+| # | Column | Type | Description |
+|---|---|---|---|
+| 0 | CorrelationId | string | Correlation identifier for the rule execution |
+| 1 | InsertedAt | datetime | Timestamp when the record was inserted |
+| 2 | BuildId | string | Run/build identifier |
+| 3 | PolicyRan | bool | Whether the policy was executed |
+| 4 | PolicyPassed | bool | Whether the policy passed |
+| 5 | Data | string | Rule execution data |
+| 6 | MetaData | dynamic | Additional metadata (JSON) |
+
+**Cols to be added:**
+
+| Column | Type | Description |
+|---|---|---|
+| PolicyName | string | Name of the policy |
+| Version | string | Policy version |
+| Mode | string | Policy execution mode |
+
+---
+
+## External Table: m365gating_GatingRequestMetrics
+
+**Cluster:** `policyhub-kusto-prod.centralus`
+**Database:** `PolicyHubAnalytics`
+**Table:** `m365gating_GatingRequestMetrics`
+**Description:** Follower/materialized view of GatingRequestMetrics from the M365Gating cluster, capturing per-stage gating compliance status and metadata.
+
+| # | Column | Type | Description |
+|---|---|---|---|
+| 0 | CorrelationId | string | Correlation identifier for the gating request |
+| 1 | MetricCreationTime | datetime | Timestamp when the metric was created |
+| 2 | OrganizationName | string | Azure DevOps organization/account name (same as AdoAccount) |
+| 3 | ProjectName | string | ADO project name |
+| 4 | ProjectId | string | ADO project GUID |
+| 5 | DefinitionId | string | Pipeline definition ID |
+| 6 | BuildId | string | Run/build identifier |
+| 7 | ServiceTreeId | string | ServiceTree GUID |
+| 8 | StageName | string | Deployment stage name |
+| 9 | StageAttempt | string | Stage attempt number |
+| 10 | JobAttempt | string | Job attempt number |
+| 11 | Cloud | string | Target cloud environment |
+| 12 | IsProduction | bool | Whether this is a production deployment |
+| 13 | GateType | string | Type of gate applied |
+| 14 | OverallGatingCompliantStatus | string | Overall gating compliance status |
+| 15 | Metadata | dynamic | Additional metadata (JSON) |
+
+**Cols to be added:**
+
+| Column | Type | Description |
+|---|---|---|
+| Trainset | string | Trainset ID |
+| DeploymentType | string | Deployment type |
+| Ring | string | Deployment ring |
+| Namespace | string | COSMIC namespace, or "Non-Cosmic" |
+| isCosmicService | int (0/1) | 1 if service has COSMIC pipelines |
+| Ev2ServiceType | string | EV2 service classification (e.g. "RS Only", "RA Only", "Hybrid") |
+
+---
+
+## External Table: m365gating_RuleExecutionMetrics
+
+**Cluster:** `policyhub-kusto-prod.centralus`
+**Database:** `PolicyHubAnalytics`
+**Table:** `m365gating_RuleExecutionMetrics`
+**Description:** Follower/materialized view of RuleExecutionMetrics from the M365Gating cluster, capturing per-build rule execution results.
+
+| # | Column | Type | Description |
+|---|---|---|---|
+| 0 | CorrelationId | string | Correlation identifier for the rule execution |
+| 1 | BuildId | string | Run/build identifier |
+| 2 | PolicyRan | bool | Whether the policy was executed |
+| 3 | PolicyPassed | bool | Whether the policy passed |
+| 4 | Data | string | Rule execution data |
+| 5 | MetaData | dynamic | Additional metadata (JSON) |
+
+**Cols to be added:**
+
+| Column | Type | Description |
+|---|---|---|
+| PolicyName | string | Name of the policy |
+| Version | string | Policy version |
+| Mode | string | Policy execution mode |

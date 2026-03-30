@@ -20,4 +20,33 @@
 
 
 
-5th -> 11th
+New changes after Design review
+1. formalize design requirements and scope: New policy domains, anything else we are planning on including?
+2. shift to policy Hub as source of truth and destination timeline and path 
+	1. Backfilling policyHub data -> Cannot be backfilled as there is no way to map columns to their data in RuleExecutionMetrics. Data for some cols is empty and policyName only appears in error message. impossible to backfill since columns can't be identified. New records will have to be created from scratch and inserted.
+	2. OR waiting 60 days for database tables to be operational
+3. Telemetry
+4. Rollback strategy
+5. Roll-forward strategy
+	1. changes in query
+		a. addition of features
+		b. changes in definitions
+			i. backfilling old data?
+			ii. Rebuilding old data?
+	2. changes in source tables
+6. Usage and load -> we are saying, table will be single source of truth for materialized view for different policy domains/enforces/other needs. user load?
+	1. deployment portal
+	2. any other dashboards/users
+7. required SLA vs feasible SLA due to ingestion times
+	1. Hybrid Approach with tables for backfilling
+		i. build api for latest updates
+		ii. timeline API for latest updates
+	3. or only pull from tables and guarantee 6 to 24h SLA
+
+Optimizations: hash the keys
+
+
+############## Current new features ###################
+1. Float Ev2 stage type in gating request params and then summarize at query time. OR calculate it as a separate table and join.
+2. Backfilling all tables in gating and policyHub Kusto clusters.
+	

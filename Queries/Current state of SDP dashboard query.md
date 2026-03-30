@@ -20,12 +20,12 @@ let exemptedPipelines = dynamic([
 // Workload Info
 let sglist = dynamic(["IC3","Yammer","TAOS","O365 FAST","Substrate Platform","Mesh","Microsoft Search Assistants & Intelligence (MSAI)","O365 Enterprise Cloud","Microsoft Teams"]);
 let orglist = dynamic(["WebXT","OPG","OneDrive/SharePoint","Data Security and Privacy"]);
-let ServiceTree = cluster("servicetreepublic.westus").database("Shared").table("DataStudio_ServiceTree_Hierarchy_Snapshot")
+let ServiceTree = ServiceTreeHierarchySnapshot
 | where Level == "Service" and ServiceId != ""
 | project DivisionName, OrganizationName, ServiceGroupName, TeamGroupName, ServiceName, ServiceId
 | extend Workload = iif(ServiceGroupName in (sglist),ServiceGroupName,iif(OrganizationName in (orglist),OrganizationName,iif(OrganizationName has "W+D","W+D",OrganizationName)))
 | distinct ServiceId, Workload,DivisionName, OrganizationName, ServiceGroupName, TeamGroupName, ServiceName
-| join kind = leftouter (cluster("servicetreepublic.westus").database("Shared").table("DataStudio_ServiceTree_ServiceCommonMetadata_Snapshot")
+| join kind = leftouter (ServiceTreeSnapshot
 | distinct ServiceId,DevOwner) on ServiceId
 | distinct ServiceId,Workload,DevOwner,DivisionName, OrganizationName, ServiceGroupName, TeamGroupName, ServiceName
 | distinct ServiceId,Workload=iff(Workload == "Skype","M365 Core -IC3",iff(Workload == "Microsoft Teams","CAP - Microsoft Teams",Workload)),DevOwner, DivisionName, OrganizationName, ServiceGroupName, TeamGroupName, ServiceName;
@@ -37,7 +37,7 @@ let ringworkload = datatable(Workload:string,AllowedRings:dynamic)[
 let ringworkloadlist=ringworkload
 | summarize make_set(Workload);
 // Get All Above-ARM MOBR Pipelines
-let allmobrpipelines = cluster('onebranchm365release.eastus').database('onebranchreleasetelemetry').PipelineRecords
+let allmobrpipelines = PipelineRecords
 | project Timestamp=todatetime(Timestamp),AdoAccount,ProjectId,DefinitionId, ServiceGroupName, ServiceTreeGuid, Version
 | where  Timestamp between (now()-60d..now())
 | extend PipelineUrl = strcat("https://dev.azure.com/",tolower(AdoAccount),"/",ProjectId,"/_build?definitionId=",DefinitionId,"&_a=summary")
@@ -47,16 +47,16 @@ let allmobrpipelines = cluster('onebranchm365release.eastus').database('onebranc
 | where not(ServiceGroupName contains "AAD")
 | extend Version_Revised=iff(Version == "","V1",Version)
 | distinct  AdoAccount,ProjectId,DefinitionId,PipelineUrl,Version;
-let belowarmpipelines= cluster('onebranchm365release.eastus').database('onebranchreleasetelemetry').TimelineRecords
+let belowarmpipelines= TimelineRecords
 | where Task contains "StratusTriggerTask"
 | distinct AdoAccount,ProjectId,Id
-| join kind=leftouter cluster('onebranchm365release.eastus').database('onebranchreleasetelemetry').PipelineRecords on AdoAccount,ProjectId,Id // join between timeline records and pipeline records
+| join kind=leftouter PipelineRecords on AdoAccount,ProjectId,Id // join between timeline records and pipeline records
 | extend PipelineUrl = strcat("https://dev.azure.com/",tolower(AdoAccount),"/",ProjectId,"/_build?definitionId=",DefinitionId,"&_a=summary")
 | summarize make_set(PipelineUrl);
 let abovearmMOBRpipelines=allmobrpipelines
 | where not(PipelineUrl has_any (belowarmpipelines))
 | summarize make_set(PipelineUrl);
-let abovearmmobrpipelineslastrun = cluster('onebranchm365release.eastus').database('onebranchreleasetelemetry').PipelineRecords
+let abovearmmobrpipelineslastrun = PipelineRecords
 | project Timestamp=todatetime(Timestamp),AdoAccount,ProjectId,DefinitionId, ServiceGroupName, ServiceTreeGuid, Version,Id
 | where  Timestamp between (now()-60d..now())
 | extend PipelineUrl = strcat("https://dev.azure.com/",tolower(AdoAccount),"/",ProjectId,"/_build?definitionId=",DefinitionId,"&_a=summary")
@@ -69,40 +69,51 @@ let abovearmmobrpipelineslastrun = cluster('onebranchm365release.eastus').databa
 | where not(PipelineUrl has_any (belowarmpipelines))
 | distinct PipelineUrl,ServiceId=ServiceTreeGuid;
 // Get YAML ID's for Last Run of All MOBR Pipelines
-let lastrunyaml = cluster('1es').database('AzureDevOps').BuildYamlMap
+let lastrunyaml = BuildYamlMapSnapshot
 | extend PipelineUrl = strcat("https://dev.azure.com/",tolower(OrganizationName),"/",ProjectId,"/_build?definitionId=",DefinitionId,"&_a=summary")
 | where PipelineUrl has_any (abovearmMOBRpipelines)
 | summarize arg_max(BuildId,YamlId) by OrganizationName,ProjectId,DefinitionId,PipelineUrl;
-let lastrunyamllist = cluster('1es').database('AzureDevOps').BuildYamlMap
+let lastrunyamllist = BuildYamlMapSnapshot
 | extend PipelineUrl = strcat("https://dev.azure.com/",tolower(OrganizationName),"/",ProjectId,"/_build?definitionId=",DefinitionId,"&_a=summary")
 | where PipelineUrl has_any (abovearmMOBRpipelines)
 | summarize arg_max(BuildId,YamlId) by OrganizationName,ProjectId,DefinitionId, PipelineUrl
 | summarize make_set(YamlId);
-let stagedata=cluster('1es').database('AzureDevOps').BuildYaml
+let stagedata=BuildYamlSnapshot
 | where YamlId has_any (lastrunyamllist) // 6112 pipelines (before abovearm last run filter is applied)
 | extend taskname = parse_json(Data).task.name
 | where Type in ("stage", "job", "task")
 | summarize Jobs = make_set(Index) by StageIndex = Index, StageName = tostring(parse_json(Data).stage),YamlId
 | join (
-    cluster('1es').database('AzureDevOps').BuildYaml
+    BuildYamlSnapshot
     | where YamlId has_any (lastrunyamllist)
     | where Type == "job"
     | project JobIndex = Index, StageIndex = ParentIndex,YamlId
 ) on StageIndex,YamlId
 | join (
-    cluster('1es').database('AzureDevOps').BuildYaml
+    BuildYamlSnapshot
     | where YamlId has_any (lastrunyamllist)
     | where Type == "task"
-    | project TaskName =  parse_json(Data).task.name,deploymentRing = parse_json(Data).inputs.deploymentRing, namespaceRingJSON = parse_json(Data).inputs.namespaceRingJson, ParentJobIndex = ParentIndex,YamlId
+    | project TaskName = parse_json(Data).task.name, deploymentRing = parse_json(Data).inputs.deploymentRing, namespaceRingJSON = parse_json(Data).inputs.namespaceRingJson, ParentJobIndex = ParentIndex,YamlId
 ) on $left.JobIndex == $right.ParentJobIndex,YamlId
-| project StageName, TaskName,YamlId,deploymentRing,namespaceRingJSON
+| project StageIndex, StageName, TaskName,YamlId,deploymentRing,namespaceRingJSON
 | order by StageName asc
-| summarize Tasks=make_set(TaskName),DeploymentRing=make_set(deploymentRing),namespaceRingJSON=make_set(namespaceRingJSON) by StageName,YamlId;
-let pipelinename=cluster('1es').database('AzureDevOps').BuildYaml
+| summarize Tasks=make_set(TaskName),DeploymentRing=make_set(deploymentRing),namespaceRingJSON=make_set(namespaceRingJSON) by StageIndex,StageName,YamlId;
+let embeddedTasksByStage = BuildYamlSnapshot
+| where YamlId has_any (lastrunyamllist)
+| where Type == "job"
+| extend EmbeddedTasks = extract_all(@'"task"\s*:\s*"([^"]+)"', tostring(Data))
+| mv-expand EmbeddedTask = EmbeddedTasks to typeof(string)
+| project StageIndex = ParentIndex, YamlId, EmbeddedTask
+| summarize EmbeddedTasks = make_set(EmbeddedTask) by StageIndex, YamlId;
+let stagedata2 = stagedata
+| lookup embeddedTasksByStage on StageIndex, YamlId
+| extend Tasks = set_union(Tasks, coalesce(EmbeddedTasks, dynamic([])))
+| project-away StageIndex, EmbeddedTasks;
+let pipelinename=BuildYamlSnapshot
 | extend PipelineUrl = strcat("https://dev.azure.com/",tolower(OrganizationName),"/",ProjectId,"/_build?definitionId=",DefinitionId,"&_a=summary")
 | where Index == 0
 | distinct PipelineUrl,YamlId,DisplayName;
-let stagering2= stagedata
+let stagering2= stagedata2
 | where Tasks contains "lockbox-approval-request-prod_with_onebranch" and Tasks contains "ExpressV2Internal" // RS only tasks.
 | join kind=leftouter lastrunyaml on YamlId
 | project PipelineUrl,BuildId,StageName,Tasks,DeploymentRing,namespaceRingJSON,YamlId
@@ -127,7 +138,7 @@ let stagering2= stagedata
 let stageLevelDetails = stagering2;
 let stagering = stagering2
 | summarize Total_Lockbox_Ev2Classic_Stages=dcount(StageName), OnboardedStages=sum(Onboarded),NotOnboardedStages=make_set_if(StageName,Onboarded == 0) by PipelineUrl,YamlId,runurl,ServiceId,Workload,DevOwner; // 743 services, 3853 pipelines
-let trainsetpipelines= cluster('1es').database('AzureDevOps').BuildYaml
+let trainsetpipelines= BuildYamlSnapshot
 | where YamlId has_any (lastrunyamllist)
 | where Data contains "trainset"
 | project OrganizationName,ProjectId,DefinitionId,YamlId,Data,EtlIngestDate
@@ -137,22 +148,22 @@ let trainsetpipelines= cluster('1es').database('AzureDevOps').BuildYaml
 | extend trainsetid=split(trainset.value,"\"")[3]
 | extend PipelineUrl = strcat("https://dev.azure.com/",tolower(OrganizationName),"/",ProjectId,"/_build?definitionId=",DefinitionId,"&_a=summary")
 | distinct PipelineUrl,trainsetid=tostring(trainsetid),YamlId;
-let cloudpipelines= cluster('1es').database('AzureDevOps').BuildYaml
+let cloudpipelines= BuildYamlSnapshot
 | where YamlId has_any (lastrunyamllist)
 | extend cloud = parse_json(Data).inputs.cloud
 | extend PipelineUrl = strcat("https://dev.azure.com/",tolower(OrganizationName),"/",ProjectId,"/_build?definitionId=",DefinitionId,"&_a=summary")
 | distinct PipelineUrl,cloud=tostring(cloud), YamlId;
-let deploymenttypepipelines =cluster('1es').database('AzureDevOps').BuildYaml
+let deploymenttypepipelines =BuildYamlSnapshot
 | where YamlId has_any (lastrunyamllist)
 | extend deploymentType =iff( isempty(tostring(parse_json(Data).inputs.deploymentType)), "Normal", tostring(parse_json(Data).inputs.deploymentType))
 | extend PipelineUrl = strcat( "https://dev.azure.com/", tolower(OrganizationName), "/", ProjectId, "/_build?definitionId=", DefinitionId, "&_a=summary" )
 | distinct PipelineUrl, deploymentType, YamlId;
-let ingestdateandpipelinename= cluster('1es').database('AzureDevOps').BuildYaml
+let ingestdateandpipelinename= BuildYamlSnapshot
 | where YamlId has_any (lastrunyamllist)
 | extend PipelineUrl = strcat("https://dev.azure.com/",tolower(OrganizationName),"/",ProjectId,"/_build?definitionId=",DefinitionId,"&_a=summary")
 | summarize IngestDate=max(EtlIngestDate) by YamlId,PipelineUrl;
 //Services using RA
-let raservices=stagedata
+let raservices=stagedata2
 | where Tasks contains "Ev2RARollout"
 | distinct StageName, YamlId
 | join kind=leftouter lastrunyaml on YamlId
@@ -162,7 +173,7 @@ let raservices=stagedata
 | distinct PipelineUrl,YamlId,ServiceId
 | where ServiceId != ""
 | summarize make_set(ServiceId);
-let pipelineInfo = cluster('onebranchm365release.eastus').database('onebranchreleasetelemetry').PipelineRecords
+let pipelineInfo = PipelineRecords
 | project Timestamp=todatetime(Timestamp),AdoAccount,ProjectId,DefinitionId, ProjectName, ServiceId = ServiceTreeGuid, Version,Id
 | where  Timestamp between (now()-60d..now())
 | extend PipelineUrl = strcat("https://dev.azure.com/",tolower(AdoAccount),"/",ProjectId,"/_build?definitionId=",DefinitionId,"&_a=summary")
@@ -170,7 +181,7 @@ let pipelineInfo = cluster('onebranchm365release.eastus').database('onebranchrel
  // 7532 
 // ---- Service classification (Cosmic + EV2 type) ----
 let servicemetadata =
-    stagedata
+    stagedata2
     | where Tasks contains "lockbox-approval-request-prod_with_onebranch"
       and (Tasks contains "ExpressV2Internal" or Tasks contains "Ev2RARollout")
     // normalize missing ring info EXACTLY like source of truth
