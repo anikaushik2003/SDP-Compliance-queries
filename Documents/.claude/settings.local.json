@@ -1,0 +1,17 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(node generate-docx.js)",
+      "Bash(npm list:*)",
+      "Bash(npm root:*)",
+      "Bash(npm install:*)",
+      "Bash(python:*)",
+      "Bash(pip install:*)",
+      "Bash(for file:*)",
+      "Bash(do ls:*)",
+      "Read(//c/Users/anikaushik/Desktop/SDP-Compliance-queries/Documents/**)",
+      "Bash(done)",
+      "Bash(az devops:*)"
+    ]
+  }
+}

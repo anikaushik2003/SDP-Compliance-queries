@@ -1,0 +1,269 @@
+{
+    "name": "pl_backfill_gating_normalized_tables",
+    "properties": {
+        "parameters": {
+            "GatingClusterUrl": { "type": "String" },
+            "BackfillStartDate": { "type": "String" },
+            "BackfillEndDate": { "type": "String" },
+            "ChunkSizeHours": { "type": "Int", "defaultValue": 24 }
+        },
+        "activities": [
+            {
+                "name": "DisableUpdatePolicy_PolicyVersionMetrics",
+                "type": "AzureDataExplorerCommand",
+                "linkedServiceName": { "referenceName": "ls_adx_m365gating", "type": "LinkedServiceReference" },
+                "typeProperties": {
+                    "command": ".alter table PolicyVersionMetrics policy update @'[{\"IsEnabled\":false,\"Source\":\"RawMetrics\",\"Query\":\"RawMetrics\",\"IsTransactional\":true,\"PropagateIngestionProperties\":true}]'"
+                }
+            },
+            {
+                "name": "DisableUpdatePolicy_RuleExecutionMetrics",
+                "type": "AzureDataExplorerCommand",
+                "dependsOn": [{ "activity": "DisableUpdatePolicy_PolicyVersionMetrics", "dependencyConditions": ["Succeeded"] }],
+                "linkedServiceName": { "referenceName": "ls_adx_m365gating", "type": "LinkedServiceReference" },
+                "typeProperties": {
+                    "command": ".alter table RuleExecutionMetrics policy update @'[{\"IsEnabled\":false,\"Source\":\"RawMetrics\",\"Query\":\"RawMetrics\",\"IsTransactional\":true,\"PropagateIngestionProperties\":true}]'"
+                }
+            },
+            {
+                "name": "DropTable_PolicyVersionMetrics",
+                "type": "AzureDataExplorerCommand",
+                "dependsOn": [{ "activity": "DisableUpdatePolicy_RuleExecutionMetrics", "dependencyConditions": ["Succeeded"] }],
+                "linkedServiceName": { "referenceName": "ls_adx_m365gating", "type": "LinkedServiceReference" },
+                "typeProperties": {
+                    "command": ".drop table PolicyVersionMetrics ifexists"
+                }
+            },
+            {
+                "name": "DropTable_RuleExecutionMetrics",
+                "type": "AzureDataExplorerCommand",
+                "dependsOn": [{ "activity": "DropTable_PolicyVersionMetrics", "dependencyConditions": ["Succeeded"] }],
+                "linkedServiceName": { "referenceName": "ls_adx_m365gating", "type": "LinkedServiceReference" },
+                "typeProperties": {
+                    "command": ".drop table RuleExecutionMetrics ifexists"
+                }
+            },
+            {
+                "name": "CreateTable_PolicyVersionMetrics",
+                "type": "AzureDataExplorerCommand",
+                "dependsOn": [{ "activity": "DropTable_RuleExecutionMetrics", "dependencyConditions": ["Succeeded"] }],
+                "linkedServiceName": { "referenceName": "ls_adx_m365gating", "type": "LinkedServiceReference" },
+                "typeProperties": {
+                    "command": ".create table PolicyVersionMetrics (CorrelationId: string, InsertedAt: datetime, PolicyDomain: string, PolicyName: string, Version: string, PolicyMode: string, BuildId: string, PolicyRan: bool, PolicyPassed: bool, Data: string, MetaData: dynamic)"
+                }
+            },
+            {
+                "name": "CreateTable_RuleExecutionMetrics",
+                "type": "AzureDataExplorerCommand",
+                "dependsOn": [{ "activity": "CreateTable_PolicyVersionMetrics", "dependencyConditions": ["Succeeded"] }],
+                "linkedServiceName": { "referenceName": "ls_adx_m365gating", "type": "LinkedServiceReference" },
+                "typeProperties": {
+                    "command": ".create table RuleExecutionMetrics (CorrelationId: string, InsertedAt: datetime, BuildId: string, PolicyDomain: string, PolicyName: string, PolicyCompliantStatus: string)"
+                }
+            },
+            {
+                "name": "ReEnableUpdatePolicy_PolicyVersionMetrics",
+                "type": "AzureDataExplorerCommand",
+                "dependsOn": [{ "activity": "CreateTable_RuleExecutionMetrics", "dependencyConditions": ["Succeeded"] }],
+                "linkedServiceName": { "referenceName": "ls_adx_m365gating", "type": "LinkedServiceReference" },
+                "typeProperties": {
+                    "command": ".alter table PolicyVersionMetrics policy update @'[{\"IsEnabled\":true,\"Source\":\"RawMetrics\",\"Query\":\"RawMetrics | extend DomainResults = RawGatingResult.DomainResults | mv-expand DomainResult = DomainResults | where isnotnull(DomainResult) | extend PolicyResults = DomainResult.PolicyResults | mv-expand PolicyResult = PolicyResults | where isnotnull(PolicyResult) | extend PolicyVersionResults = PolicyResult.PolicyVersionResults | mv-expand PolicyVersionResult = PolicyVersionResults | where isnotnull(PolicyVersionResult) | mv-expand RuleResult = PolicyVersionResult.RuleResults | where isnotnull(RuleResult) | project CorrelationId, InsertedAt = now(), PolicyDomain = tostring(DomainResult.PolicyDomain), PolicyName = tostring(PolicyResult.PolicyName), Version = tostring(PolicyVersionResult.Version), PolicyMode = tostring(PolicyVersionResult.PolicyMode), BuildId = tostring(RuleResult.BuildId), PolicyRan = tobool(RuleResult.PolicyRan), PolicyPassed = tobool(RuleResult.PolicyPassed), Data = tostring(RuleResult.Data), MetaData = RuleResult.MetaData | union (RawMetrics | extend PolicyResults = RawGatingResult.PolicyResults | mv-expand PolicyResult = PolicyResults | where isnotnull(PolicyResult) | mv-expand RuleResult = PolicyResult.RuleResults | where isnotnull(RuleResult) | project CorrelationId, InsertedAt = now(), PolicyDomain = tostring(\\u0027\\u0027), PolicyName = tostring(PolicyResult.PolicyName), Version = tostring(\\u0027default\\u0027), PolicyMode = tostring(PolicyResult.PolicyMode), BuildId = tostring(RuleResult.BuildId), PolicyRan = tobool(RuleResult.PolicyRan), PolicyPassed = tobool(RuleResult.PolicyPassed), Data = tostring(RuleResult.Data), MetaData = RuleResult.MetaData)\",\"IsTransactional\":true,\"PropagateIngestionProperties\":true}]'"
+                }
+            },
+            {
+                "name": "ReEnableUpdatePolicy_RuleExecutionMetrics",
+                "type": "AzureDataExplorerCommand",
+                "dependsOn": [{ "activity": "ReEnableUpdatePolicy_PolicyVersionMetrics", "dependencyConditions": ["Succeeded"] }],
+                "linkedServiceName": { "referenceName": "ls_adx_m365gating", "type": "LinkedServiceReference" },
+                "typeProperties": {
+                    "command": ".alter table RuleExecutionMetrics policy update @'[{\"IsEnabled\":true,\"Source\":\"RawMetrics\",\"Query\":\"RawMetrics | extend DomainResults = RawGatingResult.DomainResults | mv-expand DomainResult = DomainResults | where isnotnull(DomainResult) | extend PolicyResults = DomainResult.PolicyResults | mv-expand PolicyResult = PolicyResults | where isnotnull(PolicyResult) | project CorrelationId, InsertedAt = now(), BuildId, PolicyDomain = tostring(DomainResult.PolicyDomain), PolicyName = tostring(PolicyResult.PolicyName), PolicyCompliantStatus = tostring(PolicyResult.PolicyCompliantStatus) | union (RawMetrics | extend PolicyResults = RawGatingResult.PolicyResults | mv-expand PolicyResult = PolicyResults | where isnotnull(PolicyResult) | project CorrelationId, InsertedAt = now(), BuildId, PolicyDomain = tostring(\\u0027\\u0027), PolicyName = tostring(PolicyResult.PolicyName), PolicyCompliantStatus = tostring(PolicyResult.PolicyCompliantStatus))\",\"IsTransactional\":true,\"PropagateIngestionProperties\":true}]'"
+                }
+            },
+            {
+                "name": "GenerateChunks",
+                "type": "SetVariable",
+                "dependsOn": [{ "activity": "ReEnableUpdatePolicy_RuleExecutionMetrics", "dependencyConditions": ["Succeeded"] }],
+                "userProperties": [],
+                "typeProperties": {
+                    "variableName": "ChunkArray",
+                    "value": {
+                        "type": "Expression",
+                        "value": "@range(0, div(sub(ticks(pipeline().parameters.BackfillEndDate), ticks(pipeline().parameters.BackfillStartDate)), mul(pipeline().parameters.ChunkSizeHours, 36000000000)))"
+                    }
+                }
+            },
+            {
+                "name": "ForEachChunk_PolicyVersionMetrics",
+                "type": "ForEach",
+                "dependsOn": [{ "activity": "GenerateChunks", "dependencyConditions": ["Succeeded"] }],
+                "typeProperties": {
+                    "isSequential": false,
+                    "batchCount": 2,
+                    "items": { "value": "@variables('ChunkArray')", "type": "Expression" },
+                    "activities": [
+                        {
+                            "name": "Backfill_PolicyVersionMetrics_Chunk",
+                            "type": "AzureDataExplorerCommand",
+                            "linkedServiceName": { "referenceName": "ls_adx_m365gating", "type": "LinkedServiceReference" },
+                            "policy": {
+                                "timeout": "01:00:00",
+                                "retry": 4,
+                                "retryIntervalInSeconds": 60,
+                                "secureOutput": false
+                            },
+                            "typeProperties": {
+                                "command": {
+                                    "type": "Expression",
+                                    "value": "@concat('.set-or-append PolicyVersionMetrics <| PolicyVersionMetrics_Backfill(datetime(', addHours(pipeline().parameters.BackfillStartDate, mul(item(), pipeline().parameters.ChunkSizeHours)), '), datetime(', addHours(pipeline().parameters.BackfillStartDate, mul(add(item(), 1), pipeline().parameters.ChunkSizeHours)), '))')"
+                                }
+                            }
+                        }
+                    ]
+                }
+            },
+            {
+                "name": "ForEachChunk_RuleExecutionMetrics",
+                "type": "ForEach",
+                "dependsOn": [{ "activity": "ForEachChunk_PolicyVersionMetrics", "dependencyConditions": ["Succeeded"] }],
+                "typeProperties": {
+                    "isSequential": false,
+                    "batchCount": 3,
+                    "items": { "value": "@variables('ChunkArray')", "type": "Expression" },
+                    "activities": [
+                        {
+                            "name": "Backfill_RuleExecutionMetrics_Chunk",
+                            "type": "AzureDataExplorerCommand",
+                            "linkedServiceName": { "referenceName": "ls_adx_m365gating", "type": "LinkedServiceReference" },
+                            "policy": {
+                                "timeout": "01:00:00",
+                                "retry": 4,
+                                "retryIntervalInSeconds": 60,
+                                "secureOutput": false
+                            },
+                            "typeProperties": {
+                                "command": {
+                                    "type": "Expression",
+                                    "value": "@concat('.set-or-append RuleExecutionMetrics <| RuleExecutionMetrics_Backfill(datetime(', addHours(pipeline().parameters.BackfillStartDate, mul(item(), pipeline().parameters.ChunkSizeHours)), '), datetime(', addHours(pipeline().parameters.BackfillStartDate, mul(add(item(), 1), pipeline().parameters.ChunkSizeHours)), '))')"
+                                }
+                            }
+                        }
+                    ]
+                }
+            },
+            {
+                "name": "Validate_RowCounts",
+                "description": "Query row counts for PolicyVersionMetrics and RuleExecutionMetrics, plus check PolicyDomain population",
+                "type": "Lookup",
+                "dependsOn": [{ "activity": "ForEachChunk_RuleExecutionMetrics", "dependencyConditions": ["Succeeded"] }],
+                "typeProperties": {
+                    "source": {
+                        "type": "AzureDataExplorerSource",
+                        "query": "let pvmCount = toscalar(PolicyVersionMetrics | count); let remCount = toscalar(RuleExecutionMetrics | count); let pvmEmptyDomain = toscalar(PolicyVersionMetrics | where isempty(PolicyDomain) | count); let remEmptyDomain = toscalar(RuleExecutionMetrics | where isempty(PolicyDomain) | count); print PolicyVersionMetricsCount=pvmCount, RuleExecutionMetricsCount=remCount, PVM_HasRows=pvmCount > 0, REM_HasRows=remCount > 0, PVM_EmptyPolicyDomain=pvmEmptyDomain, REM_EmptyPolicyDomain=remEmptyDomain",
+                        "queryTimeout": "00:10:00"
+                    },
+                    "dataset": {
+                        "referenceName": "ds_adx_m365gating",
+                        "type": "DatasetReference"
+                    },
+                    "firstRowOnly": true
+                }
+            },
+            {
+                "name": "CheckValidation_TablesHaveRows",
+                "description": "Fail if PolicyVersionMetrics or RuleExecutionMetrics has zero rows",
+                "type": "IfCondition",
+                "dependsOn": [{ "activity": "Validate_RowCounts", "dependencyConditions": ["Succeeded"] }],
+                "typeProperties": {
+                    "expression": {
+                        "value": "@and(equals(activity('Validate_RowCounts').output.firstRow.PVM_HasRows, true), equals(activity('Validate_RowCounts').output.firstRow.REM_HasRows, true))",
+                        "type": "Expression"
+                    },
+                    "ifFalseActivities": [
+                        {
+                            "name": "Fail_EmptyTable",
+                            "type": "Fail",
+                            "typeProperties": {
+                                "message": {
+                                    "type": "Expression",
+                                    "value": "@concat('VALIDATION FAILED: Backfilled tables have zero rows. PVM=', string(activity('Validate_RowCounts').output.firstRow.PolicyVersionMetricsCount), ' REM=', string(activity('Validate_RowCounts').output.firstRow.RuleExecutionMetricsCount))"
+                                },
+                                "errorCode": "BACKFILL_EMPTY_TABLE"
+                            }
+                        }
+                    ]
+                }
+            },
+            {
+                "name": "CheckValidation_PolicyDomainPopulated",
+                "description": "Fail if PolicyDomain is empty in PolicyVersionMetrics or RuleExecutionMetrics",
+                "type": "IfCondition",
+                "dependsOn": [{ "activity": "CheckValidation_TablesHaveRows", "dependencyConditions": ["Succeeded"] }],
+                "typeProperties": {
+                    "expression": {
+                        "value": "@and(equals(activity('Validate_RowCounts').output.firstRow.PVM_EmptyPolicyDomain, 0), equals(activity('Validate_RowCounts').output.firstRow.REM_EmptyPolicyDomain, 0))",
+                        "type": "Expression"
+                    },
+                    "ifFalseActivities": [
+                        {
+                            "name": "Fail_EmptyPolicyDomain",
+                            "type": "Fail",
+                            "typeProperties": {
+                                "message": {
+                                    "type": "Expression",
+                                    "value": "@concat('VALIDATION FAILED: Empty PolicyDomain found. PolicyVersionMetrics has ', string(activity('Validate_RowCounts').output.firstRow.PVM_EmptyPolicyDomain), ' rows with empty PolicyDomain. RuleExecutionMetrics has ', string(activity('Validate_RowCounts').output.firstRow.REM_EmptyPolicyDomain), ' rows with empty PolicyDomain.')"
+                                },
+                                "errorCode": "BACKFILL_EMPTY_POLICY_DOMAIN"
+                            }
+                        }
+                    ]
+                }
+            },
+            {
+                "name": "Validate_UpdatePoliciesEnabled",
+                "description": "Verify PolicyVersionMetrics and RuleExecutionMetrics update policies are re-enabled",
+                "type": "Lookup",
+                "dependsOn": [{ "activity": "CheckValidation_PolicyDomainPopulated", "dependencyConditions": ["Succeeded"] }],
+                "typeProperties": {
+                    "source": {
+                        "type": "AzureDataExplorerSource",
+                        "query": ".show table * policy update | where EntityName has 'PolicyVersionMetrics' or EntityName has 'RuleExecutionMetrics' | extend Policy=parse_json(tostring(parse_json(Policy)[0])) | extend IsEnabled=tobool(Policy.IsEnabled) | summarize DisabledCount=countif(IsEnabled == false), EnabledCount=countif(IsEnabled == true)",
+                        "queryTimeout": "00:02:00"
+                    },
+                    "dataset": {
+                        "referenceName": "ds_adx_m365gating",
+                        "type": "DatasetReference"
+                    },
+                    "firstRowOnly": true
+                }
+            },
+            {
+                "name": "CheckValidation_UpdatePoliciesEnabled",
+                "description": "Fail if any update policy is still disabled",
+                "type": "IfCondition",
+                "dependsOn": [{ "activity": "Validate_UpdatePoliciesEnabled", "dependencyConditions": ["Succeeded"] }],
+                "typeProperties": {
+                    "expression": {
+                        "value": "@and(equals(activity('Validate_UpdatePoliciesEnabled').output.firstRow.DisabledCount, 0), equals(activity('Validate_UpdatePoliciesEnabled').output.firstRow.EnabledCount, 2))",
+                        "type": "Expression"
+                    },
+                    "ifFalseActivities": [
+                        {
+                            "name": "Fail_UpdatePoliciesDisabled",
+                            "type": "Fail",
+                            "typeProperties": {
+                                "message": {
+                                    "type": "Expression",
+                                    "value": "@concat('VALIDATION FAILED: ', string(activity('Validate_UpdatePoliciesEnabled').output.firstRow.DisabledCount), ' update policies are still disabled. Expected both PVM and REM enabled.')"
+                                },
+                                "errorCode": "BACKFILL_UPDATE_POLICIES_DISABLED"
+                            }
+                        }
+                    ]
+                }
+            }
+        ],
+        "variables": {
+            "ChunkArray": { "type": "Array" }
+        }
+    }
+}
